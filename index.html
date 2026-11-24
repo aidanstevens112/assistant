@@ -995,20 +995,32 @@ async function runTool(name, input){
   } catch (e) { return 'Error: ' + e.message; }
 }
 
-async function callClaude(messages){
+function apiErrorText(body){
+  try { return (JSON.parse(body).error || {}).message || body; } catch (e) { return String(body).slice(0, 200); }
+}
+// The model's private "thinking" from earlier questions is tied to the exact instructions
+// it was made with, so we drop it from past turns before sending the conversation again.
+function stripThinking(msgs){
+  return msgs.map(m => {
+    if (m.role !== 'assistant' || typeof m.content === 'string') return m;
+    const kept = m.content.filter(c => c.type !== 'thinking' && c.type !== 'redacted_thinking');
+    return { role: 'assistant', content: kept.length ? kept : [{ type: 'text', text: '(no reply)' }] };
+  });
+}
+async function callClaude(messages, system){
   const tools = webSearchOk ? TOOLS.concat([WEB_SEARCH]) : TOOLS;
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': S.claudeKey, 'anthropic-version': '2023-06-01',
                'anthropic-dangerous-direct-browser-access': 'true', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'claude-haiku-5-5', max_tokens: 500, system: personality(), tools, messages })
+    body: JSON.stringify({ model: 'claude-haiku-5-5', max_tokens: 500, system, tools, messages })
   });
   if (res.status === 400 && webSearchOk){
     const body = await res.text();
-    if (/web_search/i.test(body)){ webSearchOk = false; return callClaude(messages); }   // search not available: carry on without it
-    throw Object.assign(new Error('bad request'), { status: 400 });
+    if (/web_search/i.test(body)){ webSearchOk = false; return callClaude(messages, system); }   // search not available: carry on without it
+    throw Object.assign(new Error(apiErrorText(body)), { status: 400 });
   }
-  if (!res.ok) throw Object.assign(new Error('api'), { status: res.status });
+  if (!res.ok) throw Object.assign(new Error(apiErrorText(await res.text())), { status: res.status });
   return res.json();
 }
 
@@ -1018,9 +1030,12 @@ async function askClaude(userText){
   // keep it short, and make sure we start on a plain user message
   while (history.length > 12 || (history.length && (history[0].role !== 'user' || typeof history[0].content !== 'string'))) history.shift();
   const startLen = history.length;
+  // earlier turns: remove their thinking blocks (they'd be rejected)
+  history = stripThinking(history.slice(0, startLen - 1)).concat(history.slice(startLen - 1));
+  const system = personality();   // same instructions for every step of this question
   try {
     for (let step = 0; step < 5; step++){
-      const data = await callClaude(history);
+      const data = await callClaude(history, system);
       history.push({ role: 'assistant', content: data.content });
       if (data.stop_reason === 'tool_use'){
         const results = [];
@@ -1040,7 +1055,9 @@ async function askClaude(userText){
     history.splice(startLen - 1);   // forget the failed turn
     setStatus(listenLabel());
     if (e.status === 401) return 'My Claude API key was rejected. Check it in the gear settings.';
-    if (e.status === 402 || e.status === 400) return 'The Claude API turned me down. You may be out of API credits.';
+    console.warn('[assistant] Claude API error', e.status, e.message);
+    if (e.status === 402 || /credit|billing|balance/i.test(e.message)) return 'The Claude API says you are out of API credits.';
+    if (e.status === 400) return 'The Claude API rejected that request: ' + e.message.slice(0, 120);
     if (e.status === 429) return 'Too many requests or no credits left. Try again in a minute.';
     if (e.status) return 'The Claude API returned error ' + e.status + '.';
     throw e;
