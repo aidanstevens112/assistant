@@ -176,6 +176,12 @@
       <label for="sBlunt">Bluntness: <span id="bluntVal"></span></label>
       <input id="sBlunt" type="range" min="0" max="100" step="5" style="width:100%">
       <div class="hint">You can also just say "set humor to 60%".</div>
+      <label for="sCity">Home city (for weather)</label>
+      <input id="sCity" type="text" autocomplete="off" placeholder="College Station, TX">
+      <label for="sGClient">Google Client ID (for Calendar &amp; Gmail)</label>
+      <input id="sGClient" type="text" autocomplete="off" placeholder="....apps.googleusercontent.com">
+      <div class="row" style="margin-top:10px"><button id="gConnect" type="button">CONNECT GOOGLE</button></div>
+      <div class="hint" id="gState">Not connected.</div>
       <label for="sBg">Background image</label>
       <input id="sBg" type="file" accept="image/*">
       <div id="bgPreview"></div>
@@ -222,6 +228,8 @@ const DEFAULTS = {
   claudeKey: "",
   listen: false,
   wakeWord: "",
+  homeCity: "College Station, TX",
+  gClientId: "",
   humor: 50,
   blunt: 95,
   elKey: "",
@@ -576,6 +584,7 @@ function openSettings(){
   $('sUseEl').checked = !!S.useEl; $('sElKey').value = S.elKey || ''; $('sElVoice').value = S.elVoice || '';
   $('sBgB').value = S.bgBright; $('bgBVal').textContent = Math.round(S.bgBright*100) + '%';
   $('sListen').checked = !!S.listen; $('sWake').value = S.wakeWord || ''; $('sClaudeKey').value = S.claudeKey || '';
+  $('sCity').value = S.homeCity || ''; $('sGClient').value = S.gClientId || ''; updateGState();
   $('sHumor').value = S.humor; $('humorVal').textContent = S.humor + '%';
   $('sBlunt').value = S.blunt; $('bluntVal').textContent = S.blunt + '%';
   $('sRate').value = S.rate; $('rateVal').textContent = Number(S.rate).toFixed(2) + 'x';
@@ -591,6 +600,7 @@ function readForm(){
   S.useEl = $('sUseEl').checked; S.elKey = $('sElKey').value.trim(); S.elVoice = $('sElVoice').value.trim();
   S.bgBright = Number($('sBgB').value);
   S.listen = $('sListen').checked; S.wakeWord = $('sWake').value.trim(); S.claudeKey = $('sClaudeKey').value.trim();
+  S.homeCity = $('sCity').value.trim() || 'College Station, TX'; S.gClientId = $('sGClient').value.trim();
   S.humor = Number($('sHumor').value); S.blunt = Number($('sBlunt').value);
   if (pendingBg !== null) S.background = pendingBg;
 }
@@ -611,6 +621,12 @@ $('save').onclick = () => {
 $('sBgB').oninput = () => { $('bgBVal').textContent = Math.round($('sBgB').value*100) + '%'; document.getElementById('bg').style.opacity = $('sBgB').value; };
 $('sHumor').oninput = () => { $('humorVal').textContent = $('sHumor').value + '%'; };
 $('sBlunt').oninput = () => { $('bluntVal').textContent = $('sBlunt').value + '%'; };
+$('gConnect').onclick = async () => {
+  S.gClientId = $('sGClient').value.trim(); saveSettings();
+  $('gState').textContent = 'Opening Google sign-in…';
+  try { await gConnect(true); } catch(e){ $('gState').textContent = e.message; return; }
+  updateGState();
+};
 $('bgClear').onclick = () => { pendingBg = ''; showBgPreview(''); };
 
 // Shrink the chosen background image so it fits in browser storage.
@@ -647,36 +663,209 @@ Humor level: ${S.humor}% (0 = no jokes, 100 = a dry remark in most replies, but 
 Bluntness level: ${S.blunt}% (0 = gentle and diplomatic, 100 = as direct as possible). No setting changes honesty: never say anything false, say plainly when you are unsure.
 He is an accounting student (Texas A&M, audit track). For coursework, follow standard course methodology and don't round until the final answer.
 Your reply will be SPOKEN, so: 1 to 2 short sentences by default (under 40 words). No lists, no markdown, no emojis, no URLs. Only go longer if he explicitly asks for detail.
-You cannot see his email, calendar, or files from here. If he asks for those, tell him to use the Claude app for that.
+You have tools: open websites, set timers, get the weather (his home city is ${S.homeCity}), search the web, and read (not send) his Google Calendar and Gmail. Use them when they help; don't ask permission for read-only lookups.
+When summarizing emails or events, give the gist in a sentence or two (who/what/when), never read full emails aloud unless asked. You cannot send emails, delete anything, or change his calendar. If a tool says Google is not connected, tell him to click Connect Google in the gear settings.
 Current local time: ${now.toLocaleString()}.`;
 }
 
 let history = [];   // the last few back-and-forths, so it remembers the conversation
+
+/* ---------- ABILITIES (tools the AI can use) ---------- */
+const TOOLS = [
+  { name: 'open_website', description: 'Open a website in a new browser tab. Use for requests like "open Canvas", "pull up Gmail", "go to YouTube". Shortcuts: canvas, gmail, calendar, howdy, youtube, apple music, spotify, google drive, chatgpt is not allowed. For anything else pass a domain or a search phrase.',
+    input_schema: { type: 'object', properties: { target: { type: 'string', description: 'Shortcut name, domain, or search phrase' } }, required: ['target'] } },
+  { name: 'set_timer', description: 'Set a countdown timer or reminder that speaks when done.',
+    input_schema: { type: 'object', properties: { minutes: { type: 'number' }, label: { type: 'string', description: 'What the timer is for' } }, required: ['minutes'] } },
+  { name: 'get_weather', description: 'Get current weather and the forecast. Defaults to his home city.',
+    input_schema: { type: 'object', properties: { location: { type: 'string', description: 'City, e.g. "Houston, TX". Omit for home city.' } } } },
+  { name: 'get_calendar_events', description: "Read upcoming events from his Google Calendar.",
+    input_schema: { type: 'object', properties: { days_ahead: { type: 'integer', description: '1 = today only, 7 = this week' } } } },
+  { name: 'get_recent_emails', description: 'Read a short list of his Gmail messages (sender, subject, snippet). Read-only.',
+    input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Gmail search, default "is:unread newer_than:2d"' }, max: { type: 'integer' } } } }
+];
+const WEB_SEARCH = { type: 'web_search_20250305', name: 'web_search', max_uses: 2 };
+let webSearchOk = true;   // turned off automatically if the API rejects it
+
+const SHORTCUTS = {
+  'canvas': 'https://canvas.tamu.edu', 'gmail': 'https://mail.google.com', 'email': 'https://mail.google.com',
+  'calendar': 'https://calendar.google.com', 'google calendar': 'https://calendar.google.com',
+  'howdy': 'https://howdy.tamu.edu', 'youtube': 'https://www.youtube.com', 'apple music': 'https://music.apple.com',
+  'music': 'https://music.apple.com', 'spotify': 'https://open.spotify.com', 'google drive': 'https://drive.google.com',
+  'drive': 'https://drive.google.com', 'claude': 'https://claude.ai'
+};
+function openWebsite({ target }){
+  const t = (target || '').trim(), key = t.toLowerCase();
+  let url = SHORTCUTS[key];
+  if (!url && /^[\w-]+(\.[\w-]+)+(\/.*)?$/.test(t)) url = 'https://' + t;
+  if (!url && /^https?:\/\//.test(t)) url = t;
+  if (!url) url = 'https://www.google.com/search?q=' + encodeURIComponent(t);
+  const w = window.open(url, '_blank');
+  return w ? 'Opened ' + url : 'The browser blocked the new tab. Tell him to allow pop-ups for this site (icon at the right end of the address bar).';
+}
+
+let timers = [];
+function setTimer({ minutes, label }){
+  const m = Number(minutes);
+  if (!(m > 0) || m > 24 * 60) return 'Invalid timer length.';
+  const lbl = label || 'Timer';
+  const id = setTimeout(() => {
+    timers = timers.filter(x => x.id !== id);
+    speak(`${lbl} is done.`);
+    try { if (Notification.permission === 'granted') new Notification(lbl + ' is done'); } catch(e){}
+  }, m * 60000);
+  timers.push({ id, lbl, end: Date.now() + m * 60000 });
+  try { if (window.Notification && Notification.permission === 'default') Notification.requestPermission(); } catch(e){}
+  return `Timer set: ${lbl}, ${m} minutes. (Timers reset if the window is closed or refreshed.)`;
+}
+
+const WMO = {0:'clear',1:'mostly clear',2:'partly cloudy',3:'overcast',45:'fog',48:'fog',51:'light drizzle',53:'drizzle',55:'heavy drizzle',61:'light rain',63:'rain',65:'heavy rain',71:'light snow',73:'snow',75:'heavy snow',80:'rain showers',81:'rain showers',82:'heavy showers',95:'thunderstorms',96:'thunderstorms with hail',99:'thunderstorms with hail'};
+async function getWeather({ location }){
+  const place = (location || S.homeCity || 'College Station, TX').trim();
+  const name = place.split(',')[0].trim();
+  const g = await (await fetch('https://geocoding-api.open-meteo.com/v1/search?count=5&language=en&format=json&name=' + encodeURIComponent(name))).json();
+  if (!g.results || !g.results.length) return 'Could not find that location: ' + place;
+  const region = (place.split(',')[1] || '').trim().toLowerCase();
+  const hit = g.results.find(r => region && ((r.admin1 || '').toLowerCase().startsWith(region) || (r.country_code || '').toLowerCase() === region)) ||
+              g.results.find(r => r.country_code === 'US') || g.results[0];
+  const w = await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${hit.latitude}&longitude=${hit.longitude}&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto&forecast_days=3`)).json();
+  const c = w.current, d = w.daily;
+  const days = d.time.map((t, i) => `${i === 0 ? 'Today' : i === 1 ? 'Tomorrow' : t}: ${WMO[d.weather_code[i]] || 'mixed'}, high ${Math.round(d.temperature_2m_max[i])}F, low ${Math.round(d.temperature_2m_min[i])}F, ${d.precipitation_probability_max[i]}% chance of rain`).join('; ');
+  return `${hit.name}, ${hit.admin1 || hit.country}: now ${Math.round(c.temperature_2m)}F (feels ${Math.round(c.apparent_temperature)}F), ${WMO[c.weather_code] || 'mixed'}, wind ${Math.round(c.wind_speed_10m)} mph. ${days}.`;
+}
+
+/* ---- Google (read-only Calendar + Gmail) ---- */
+const G_SCOPES = 'https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.readonly';
+let gTok = null, gClient = null;
+try { gTok = JSON.parse(localStorage.getItem('assistant.gtoken') || 'null'); } catch(e){}
+function gValid(){ return gTok && gTok.exp > Date.now() + 60000; }
+function updateGState(){
+  const el = document.getElementById('gState'); if (!el) return;
+  el.textContent = !S.gClientId ? 'Not set up. Paste a Google Client ID first.' : gValid() ? 'Connected (read-only).' : 'Not connected. Click Connect Google.';
+}
+function loadGis(){
+  return new Promise((res, rej) => {
+    if (window.google && google.accounts && google.accounts.oauth2) return res();
+    const sc = document.createElement('script'); sc.src = 'https://accounts.google.com/gsi/client';
+    sc.onload = () => res(); sc.onerror = () => rej(new Error('Could not load Google sign-in.'));
+    document.head.appendChild(sc);
+  });
+}
+async function gConnect(interactive){
+  if (!S.gClientId) throw new Error('Google is not set up. Paste the Google Client ID in the gear settings.');
+  await loadGis();
+  return new Promise((res, rej) => {
+    gClient = google.accounts.oauth2.initTokenClient({
+      client_id: S.gClientId, scope: G_SCOPES,
+      callback: r => {
+        if (r.error){ rej(new Error('Google sign-in failed: ' + r.error)); return; }
+        gTok = { t: r.access_token, exp: Date.now() + (Number(r.expires_in) || 3600) * 1000 };
+        try { localStorage.setItem('assistant.gtoken', JSON.stringify(gTok)); } catch(e){}
+        updateGState(); res(gTok.t);
+      },
+      error_callback: e => rej(new Error('Google sign-in was closed or blocked (' + (e && e.type) + ').'))
+    });
+    gClient.requestAccessToken({ prompt: interactive ? 'consent' : '' });
+  });
+}
+async function gFetch(url){
+  if (!gValid()){
+    try { await gConnect(false); }
+    catch(e){ throw new Error('Google is not connected. Tell him to click Connect Google in the gear settings.'); }
+  }
+  const r = await fetch(url, { headers: { Authorization: 'Bearer ' + gTok.t } });
+  if (r.status === 401){ gTok = null; throw new Error('Google access expired. Tell him to click Connect Google in the gear settings.'); }
+  if (!r.ok) throw new Error('Google returned error ' + r.status + '.');
+  return r.json();
+}
+async function getCalendar({ days_ahead }){
+  const n = Math.max(1, Math.min(14, Number(days_ahead) || 1));
+  const start = new Date(); const end = new Date(); end.setHours(23, 59, 59, 0); end.setDate(end.getDate() + n - 1);
+  const data = await gFetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&maxResults=15&timeMin=' + encodeURIComponent(start.toISOString()) + '&timeMax=' + encodeURIComponent(end.toISOString()));
+  const items = data.items || [];
+  if (!items.length) return 'No events in that range.';
+  return items.map(e => {
+    const st = e.start.dateTime ? new Date(e.start.dateTime).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' }) : (e.start.date + ' (all day)');
+    return `${st}: ${e.summary || '(no title)'}${e.location ? ' at ' + e.location : ''}`;
+  }).join('\n');
+}
+async function getEmails({ query, max }){
+  const q = query || 'is:unread newer_than:2d';
+  const n = Math.max(1, Math.min(10, Number(max) || 5));
+  const list = await gFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=' + n + '&q=' + encodeURIComponent(q));
+  const msgs = list.messages || [];
+  if (!msgs.length) return 'No emails match "' + q + '".';
+  const out = [];
+  for (const m of msgs){
+    const d = await gFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/' + m.id + '?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date');
+    const h = n => ((d.payload && d.payload.headers) || []).find(x => x.name === n)?.value || '';
+    out.push(`From ${h('From').replace(/<.*>/, '').trim()}: "${h('Subject')}" (${h('Date').slice(0, 16)}) ${d.snippet || ''}`.slice(0, 300));
+  }
+  return out.join('\n');
+}
+
+async function runTool(name, input){
+  setStatus({ open_website: 'Opening…', set_timer: 'Setting timer…', get_weather: 'Checking the weather…',
+              get_calendar_events: 'Checking your calendar…', get_recent_emails: 'Checking your email…' }[name] || 'Working…');
+  try {
+    if (name === 'open_website') return openWebsite(input);
+    if (name === 'set_timer') return setTimer(input);
+    if (name === 'get_weather') return await getWeather(input);
+    if (name === 'get_calendar_events') return await getCalendar(input);
+    if (name === 'get_recent_emails') return await getEmails(input);
+    return 'Unknown tool.';
+  } catch (e) { return 'Error: ' + e.message; }
+}
+
+async function callClaude(messages){
+  const tools = webSearchOk ? TOOLS.concat([WEB_SEARCH]) : TOOLS;
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': S.claudeKey, 'anthropic-version': '2023-06-01',
+               'anthropic-dangerous-direct-browser-access': 'true', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-haiku-5-5', max_tokens: 500, system: personality(), tools, messages })
+  });
+  if (res.status === 400 && webSearchOk){
+    const body = await res.text();
+    if (/web_search/i.test(body)){ webSearchOk = false; return callClaude(messages); }   // search not available: carry on without it
+    throw Object.assign(new Error('bad request'), { status: 400 });
+  }
+  if (!res.ok) throw Object.assign(new Error('api'), { status: res.status });
+  return res.json();
+}
+
 async function askClaude(userText){
   if (!S.claudeKey){ return "I don't have a Claude API key yet. Add one in the gear settings."; }
   history.push({ role: 'user', content: userText });
-  history = history.slice(-12);
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': S.claudeKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
-      'content-type': 'application/json'
-    },
-    body: JSON.stringify({ model: 'claude-haiku-5-5', max_tokens: 300, system: personality(), messages: history })
-  });
-  if (!res.ok){
-    history.pop();
-    if (res.status === 401) return 'My Claude API key was rejected. Check it in the gear settings.';
-    if (res.status === 402 || res.status === 400) return 'The Claude API turned me down. You may be out of API credits.';
-    if (res.status === 429) return "Too many requests or no credits left. Try again in a minute.";
-    return 'The Claude API returned error ' + res.status + '.';
+  // keep it short, and make sure we start on a plain user message
+  while (history.length > 12 || (history.length && (history[0].role !== 'user' || typeof history[0].content !== 'string'))) history.shift();
+  const startLen = history.length;
+  try {
+    for (let step = 0; step < 5; step++){
+      const data = await callClaude(history);
+      history.push({ role: 'assistant', content: data.content });
+      if (data.stop_reason === 'tool_use'){
+        const results = [];
+        for (const block of data.content){
+          if (block.type === 'tool_use') results.push({ type: 'tool_result', tool_use_id: block.id, content: String(await runTool(block.name, block.input || {})) });
+        }
+        history.push({ role: 'user', content: results });
+        continue;
+      }
+      if (data.stop_reason === 'pause_turn') continue;   // web search still working
+      setStatus(listenLabel());
+      const reply = (data.content || []).filter(c => c.type === 'text').map(c => c.text).join(' ').replace(/\s+/g, ' ').trim();
+      return reply || 'Done.';
+    }
+    return 'That took too many steps. Try asking more simply.';
+  } catch (e) {
+    history.splice(startLen - 1);   // forget the failed turn
+    setStatus(listenLabel());
+    if (e.status === 401) return 'My Claude API key was rejected. Check it in the gear settings.';
+    if (e.status === 402 || e.status === 400) return 'The Claude API turned me down. You may be out of API credits.';
+    if (e.status === 429) return 'Too many requests or no credits left. Try again in a minute.';
+    if (e.status) return 'The Claude API returned error ' + e.status + '.';
+    throw e;
   }
-  const data = await res.json();
-  const reply = (data.content || []).filter(c => c.type === 'text').map(c => c.text).join(' ').trim() || 'I have nothing to add.';
-  history.push({ role: 'assistant', content: reply });
-  return reply;
 }
 
 // "set humor to 60%" is handled here directly (no API cost) and saved permanently.
@@ -690,12 +879,31 @@ function handleDial(text){
   return `${which} set to ${v} percent. Saved.`;
 }
 
+/* ---- PROTOCOLS: say "[wake word], daddy's home" or "run daddy's home protocol" ----
+   Each one runs instantly with no API cost. To add your own, copy a block below:
+   match = the words to listen for, say = what it says, open = the tabs it opens. */
+const PROTOCOLS = [
+  { name: "Daddy's home",
+    match: /dadd(y|ie)'?s? home/i,
+    say: "Welcome back. Canvas, Claude, and Gmail are open. Try to be productive.",
+    open: ['https://canvas.tamu.edu', 'https://claude.ai', 'https://mail.google.com'] }
+];
+function runProtocol(text){
+  const pr = PROTOCOLS.find(x => x.match.test(text));
+  if (!pr) return null;
+  let blocked = 0;
+  for (const url of pr.open){ if (!window.open(url, '_blank')) blocked++; }
+  return blocked
+    ? `${pr.name} protocol ran, but the browser blocked ${blocked} tab${blocked > 1 ? 's' : ''}. Allow pop-ups for this site in the address bar.`
+    : pr.say;
+}
+
 async function handleRequest(text){
   text = text.trim();
   if (!text) return;
   setStatus('Thinking…');
   showWords('“' + text + '”', true);
-  let reply = handleDial(text);
+  let reply = runProtocol(text) || handleDial(text);
   try { if (!reply) reply = await askClaude(text); }
   catch (e) { reply = "I can't reach the Claude API right now. Check your internet."; }
   setStatus(listenLabel());
