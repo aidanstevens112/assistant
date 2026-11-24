@@ -1,6 +1,6 @@
 // Tiny service worker: lets Edge install this page as an app
 // and keeps it working offline after the first visit.
-const CACHE = 'assistant-v2';
+const CACHE = 'assistant-v4';
 const FILES = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 self.addEventListener('install', e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))));
 self.addEventListener('activate', e => e.waitUntil(
