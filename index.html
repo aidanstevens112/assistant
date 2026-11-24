@@ -102,7 +102,7 @@
     width:min(520px,90vw);max-height:88vh;overflow:auto}
   .panel h2{margin:0 0 18px;font-weight:400;letter-spacing:.2em;font-size:15px}
   .panel label{display:block;margin:14px 0 6px}
-  .panel input[type=text],.panel textarea,.panel select{width:100%;box-sizing:border-box;
+  .panel input[type=text],.panel input[type=password],.panel textarea,.panel select{width:100%;box-sizing:border-box;
     background:#07090c;color:var(--silver);border:1px solid var(--line);padding:9px;
     font:inherit;font-size:14px}
   .panel textarea{height:78px;resize:vertical}
@@ -156,6 +156,14 @@
       <div class="hint">"Natural" voices sound best but need internet.</div>
       <label for="sRate">Speaking speed: <span id="rateVal"></span></label>
       <input id="sRate" type="range" min="0.7" max="1.4" step="0.05" style="width:100%">
+      <label style="display:flex;gap:8px;align-items:center;margin-top:20px">
+        <input id="sUseEl" type="checkbox"> Use ElevenLabs voice
+      </label>
+      <label for="sElKey">ElevenLabs API key</label>
+      <input id="sElKey" type="password" autocomplete="off" placeholder="Paste your key here (saved only on this computer)">
+      <label for="sElVoice">ElevenLabs Voice ID</label>
+      <input id="sElVoice" type="text" autocomplete="off" placeholder="e.g. 21m00Tcm4TlvDq8ikWAM">
+      <div class="hint">If ElevenLabs fails, it switches to the voice above and tells you why.</div>
       <label for="sBg">Background image</label>
       <input id="sBg" type="file" accept="image/*">
       <div id="bgPreview"></div>
@@ -194,7 +202,10 @@ const DEFAULTS = {
   greeting: "{greet}, {user}. It's {time} on {day}. All systems are online. Try not to procrastinate tonight.",
   voice: "",
   rate: 1,
-  background: ""
+  background: "",
+  useEl: false,
+  elKey: "",
+  elVoice: ""
 };
 const KEY = 'assistant.settings';
 function loadSettings(){
@@ -262,7 +273,7 @@ let hideTimer = null;
 let speechId = 0;       // which greeting is the latest one
 const bubble = document.getElementById('bubble');
 
-function speak(text, onBlocked){
+function speakBrowser(text, onBlocked){
   if (!synth) { showWords(text, true); return; }
   synth.cancel();
   clearTimeout(hideTimer);
@@ -318,6 +329,107 @@ function speak(text, onBlocked){
   setTimeout(() => {
     if (!started && onBlocked && myId === speechId){ synth.cancel(); onBlocked(); }
   }, 2500);
+}
+
+
+/* ---- Which voice to use: ElevenLabs if set up, otherwise the free Windows voice ---- */
+function speak(text, onBlocked){
+  if (S.useEl && S.elKey && S.elVoice){
+    speakEleven(text, onBlocked).catch(err => {
+      speaking = false;
+      showWords('Voice service problem: ' + err.message + ' Using the built-in voice.', true);
+      setTimeout(() => speakBrowser(text, onBlocked), 2500);
+    });
+  } else {
+    speakBrowser(text, onBlocked);
+  }
+}
+
+/* ---- ElevenLabs voice: fetch audio + word timings, play it, sync the bubble and ring ---- */
+let audioCtx = null, currentAudio = null;
+async function speakEleven(text, onBlocked){
+  if (synth) synth.cancel();
+  if (currentAudio){ currentAudio.pause(); currentAudio = null; }
+  clearTimeout(hideTimer);
+  const myId = ++speechId;
+
+  const res = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + encodeURIComponent(S.elVoice) +
+    '/with-timestamps?output_format=mp3_44100_128', {
+    method: 'POST',
+    headers: { 'xi-api-key': S.elKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, model_id: 'eleven_flash_v2_5' })
+  });
+  if (!res.ok){
+    const why = res.status === 401 ? 'the API key was rejected.'
+              : res.status === 404 ? 'that Voice ID was not found.'
+              : res.status === 429 ? 'out of credits or too many requests.'
+              : 'error ' + res.status + '.';
+    throw new Error(why);
+  }
+  const data = await res.json();
+  if (myId !== speechId) return;   // a newer greeting started meanwhile
+
+  // turn the audio into something playable
+  const bytes = Uint8Array.from(atob(data.audio_base64), c => c.charCodeAt(0));
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+  const audio = new Audio(url); currentAudio = audio;
+
+  // listen to the real audio so the ring moves with the voice
+  let analyser = null, buf = null;
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioCtx.createMediaElementSource(audio);
+    analyser = audioCtx.createAnalyser(); analyser.fftSize = 512;
+    src.connect(analyser); analyser.connect(audioCtx.destination);
+    buf = new Uint8Array(analyser.fftSize);
+    if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  } catch (e) { analyser = null; }
+
+  // work out when each word starts
+  const words = text.split(/\s+/).filter(Boolean);
+  const spans = showWords(text, false);
+  const al = data.alignment || data.normalized_alignment;
+  const starts = []; let p = 0;
+  for (const w of words){
+    p = text.indexOf(w, p);
+    const t = al && al.character_start_times_seconds && al.character_start_times_seconds[p];
+    starts.push(typeof t === 'number' ? t : null);
+    p += w.length;
+  }
+
+  let shown = -1;
+  const reveal = n => {
+    n = Math.min(n, words.length - 1);
+    for (let k = shown + 1; k <= n; k++) spans[k].classList.add('on');
+    if (n > shown) shown = n;
+  };
+  const loop = () => {
+    if (currentAudio !== audio || audio.paused) return;
+    const t = audio.currentTime, dur = audio.duration || 1;
+    let n = -1;
+    for (let i = 0; i < words.length; i++){
+      const st = starts[i] !== null ? starts[i] : (i / words.length) * dur;
+      if (st <= t) n = i; else break;
+    }
+    reveal(n);
+    if (analyser){
+      analyser.getByteTimeDomainData(buf);
+      let sum = 0; for (let i = 0; i < buf.length; i++){ const v = (buf[i] - 128) / 128; sum += v * v; }
+      energy = Math.max(energy, Math.min(1, Math.sqrt(sum / buf.length) * 4));
+    } else { energy = 0.6; }
+    requestAnimationFrame(loop);
+  };
+
+  audio.onplay = () => { speaking = true; bubble.classList.add('show'); requestAnimationFrame(loop); };
+  audio.onended = () => {
+    speaking = false; reveal(words.length - 1); URL.revokeObjectURL(url);
+    hideTimer = setTimeout(() => bubble.classList.remove('show'), 8000);
+  };
+  try { await audio.play(); }
+  catch (e) {
+    if (e.name === 'NotAllowedError' && onBlocked){ onBlocked(); return; }
+    throw new Error('could not play the audio.');
+  }
 }
 
 function showWords(text, allOn){
@@ -421,6 +533,7 @@ function fillVoiceList(){
 }
 function openSettings(){
   $('sName').value = S.assistantName; $('sUser').value = S.userName; $('sGreet').value = S.greeting;
+  $('sUseEl').checked = !!S.useEl; $('sElKey').value = S.elKey || ''; $('sElVoice').value = S.elVoice || '';
   $('sRate').value = S.rate; $('rateVal').textContent = Number(S.rate).toFixed(2) + 'x';
   pendingBg = null; showBgPreview(S.background); fillVoiceList(); panel.classList.add('show');
 }
@@ -431,6 +544,7 @@ function readForm(){
   S.assistantName = $('sName').value.trim(); S.userName = $('sUser').value.trim();
   S.greeting = $('sGreet').value.trim() || DEFAULTS.greeting;
   S.voice = $('sVoice').value; S.rate = Number($('sRate').value);
+  S.useEl = $('sUseEl').checked; S.elKey = $('sElKey').value.trim(); S.elVoice = $('sElVoice').value.trim();
   if (pendingBg !== null) S.background = pendingBg;
 }
 $('gear').onclick = openSettings;
