@@ -357,8 +357,11 @@ function speakBrowser(text, onBlocked){
 function speak(text, onBlocked){
   pauseListening();
   if (S.useEl && S.elKey && S.elVoice && text.length <= 350){
-    speakEleven(text, onBlocked).catch(err => {
+    speakEleven(text, onBlocked)
+      .catch(() => new Promise(r => setTimeout(r, 800)).then(() => speakEleven(text, onBlocked)))   // one automatic retry
+      .catch(err => {
       speaking = false;
+      console.warn('[assistant] ElevenLabs failed:', err.message);
       showWords('Voice service problem: ' + err.message + ' Using the built-in voice.', true);
       setTimeout(() => speakBrowser(text, onBlocked), 2500);
     });
