@@ -182,6 +182,10 @@
       <input id="sGClient" type="text" autocomplete="off" placeholder="....apps.googleusercontent.com">
       <div class="row" style="margin-top:10px"><button id="gConnect" type="button">CONNECT GOOGLE</button></div>
       <div class="hint" id="gState">Not connected.</div>
+      <label>Screens for "Daddy's home"</label>
+      <div class="row" style="margin-top:4px"><button id="scrSetup" type="button">SET UP SCREENS</button></div>
+      <div id="scrRows"></div>
+      <div class="hint" id="scrState">Click Set up screens with your monitors plugged in. Chrome will ask permission once.</div>
       <label for="sBg">Background image</label>
       <input id="sBg" type="file" accept="image/*">
       <div id="bgPreview"></div>
@@ -230,6 +234,7 @@ const DEFAULTS = {
   wakeWord: "",
   homeCity: "College Station, TX",
   gClientId: "",
+  screenMap: {},
   humor: 50,
   blunt: 95,
   elKey: "",
@@ -627,6 +632,28 @@ $('gConnect').onclick = async () => {
   try { await gConnect(true); } catch(e){ $('gState').textContent = e.message; return; }
   updateGState();
 };
+async function renderScreenRows(screens){
+  const box = $('scrRows'); box.innerHTML = '';
+  const names = { canvas: 'Canvas', claude: 'Claude', gmail: 'Gmail' };
+  for (const id of ['canvas', 'claude', 'gmail']){
+    const lab = document.createElement('label'); lab.textContent = names[id] + ' opens on:';
+    const sel = document.createElement('select'); sel.dataset.id = id;
+    screens.forEach(sc => { const o = document.createElement('option'); o.value = screenKey(sc); o.textContent = describeScreen(sc, screens);
+      if ((S.screenMap || {})[id] === o.value) o.selected = true; sel.appendChild(o); });
+    sel.onchange = () => { S.screenMap = Object.assign({}, S.screenMap, { [id]: sel.value }); saveSettings(); };
+    box.appendChild(lab); box.appendChild(sel);
+  }
+}
+$('scrSetup').onclick = async () => {
+  const screens = await getScreens(true);
+  if (!screens){ $('scrState').textContent = 'Chrome did not allow screen access. Click the icon in the address bar to allow "window management", then try again.'; return; }
+  if (screens.length < 2){ $('scrState').textContent = 'Only one screen detected. Plug in your monitors and click again.'; return; }
+  const keys = screens.map(screenKey);
+  const valid = S.screenMap && ['canvas','claude','gmail'].every(id => keys.includes(S.screenMap[id]));
+  if (!valid){ S.screenMap = defaultScreenMap(screens); saveSettings(); }
+  await renderScreenRows(screens);
+  $('scrState').textContent = `${screens.length} screens found. Change any dropdown if a site is on the wrong screen; it saves automatically.`;
+};
 $('bgClear').onclick = () => { pendingBg = ''; showBgPreview(''); };
 
 // Shrink the chosen background image so it fits in browser storage.
@@ -663,7 +690,7 @@ Humor level: ${S.humor}% (0 = no jokes, 100 = a dry remark in most replies, but 
 Bluntness level: ${S.blunt}% (0 = gentle and diplomatic, 100 = as direct as possible). No setting changes honesty: never say anything false, say plainly when you are unsure.
 He is an accounting student (Texas A&M, audit track). For coursework, follow standard course methodology and don't round until the final answer.
 Your reply will be SPOKEN, so: 1 to 2 short sentences by default (under 40 words). No lists, no markdown, no emojis, no URLs. Only go longer if he explicitly asks for detail.
-You have tools: open websites, set timers, get the weather (his home city is ${S.homeCity}), search the web, and read (not send) his Google Calendar and Gmail. Use them when they help; don't ask permission for read-only lookups.
+You have tools: control his music (play/pause/skip/volume) and play playlists, albums or songs from his Apple Music library, open websites, set timers, get the weather (his home city is ${S.homeCity}), search the web, and read (not send) his Google Calendar and Gmail. Use them when they help; don't ask permission for read-only lookups.
 When summarizing emails or events, give the gist in a sentence or two (who/what/when), never read full emails aloud unless asked. You cannot send emails, delete anything, or change his calendar. If a tool says Google is not connected, tell him to click Connect Google in the gear settings.
 Current local time: ${now.toLocaleString()}.`;
 }
@@ -683,6 +710,10 @@ const TOOLS = [
   { name: 'get_recent_emails', description: 'Read a short list of his Gmail messages (sender, subject, snippet). Read-only.',
     input_schema: { type: 'object', properties: { query: { type: 'string', description: 'Gmail search, default "is:unread newer_than:2d"' }, max: { type: 'integer' } } } }
 ];
+TOOLS.push({ name: 'control_music', description: 'Control whatever music is playing on his PC (Apple Music, Spotify, YouTube...) through his Dynamic Island app: play, pause, skip, previous, set volume, mute, or check what is playing. Cannot pick a specific song.',
+  input_schema: { type: 'object', properties: { action: { type: 'string', enum: ['status','play','pause','playpause','next','previous','volume','mute','unmute'] }, level: { type: 'integer', description: 'Volume 0-100, only for action=volume' } }, required: ['action'] } });
+TOOLS.push({ name: 'music_library', description: "Play something from his Apple Music library (a playlist, album, or song by name), turn shuffle/repeat on or off, or open his Now Playing screen. Use this for 'play X'. For pause/skip/volume use control_music.",
+  input_schema: { type: 'object', properties: { action: { type: 'string', enum: ['play_playlist','play_album','play_song','play_any','shuffle_on','shuffle_off','repeat_one','repeat_all','repeat_off','open_player'] }, name: { type: 'string', description: 'Name of the playlist, album or song' } }, required: ['action'] } });
 const WEB_SEARCH = { type: 'web_search_20250305', name: 'web_search', max_uses: 2 };
 let webSearchOk = true;   // turned off automatically if the API rejects it
 
@@ -803,6 +834,152 @@ async function getEmails({ query, max }){
   return out.join('\n');
 }
 
+
+/* ---- Music control through the Dynamic Island bridge (runs on this PC) ---- */
+const BRIDGE = 'http://localhost:48723';
+async function bridge(action, level){
+  const path = action === 'status' ? '/status' : action === 'volume' ? '/volume?level=' + Math.max(0, Math.min(100, Number(level) || 0)) : '/' + action;
+  let r;
+  try {
+    r = await fetch(BRIDGE + path, action === 'status' ? {} : { method: 'POST', body: '' });
+  } catch (e) {
+    throw new Error("I can't reach the Dynamic Island. Make sure it's running, and if Chrome asked about access to apps on this device, allow it.");
+  }
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || !d.ok) throw new Error('The Dynamic Island refused that: ' + (d.error || r.status));
+  return d;
+}
+function describeMusic(d){
+  if (!d.title) return 'Nothing is playing right now.';
+  return `${d.playing ? 'Playing' : 'Paused'}: ${d.title}${d.artist ? ' by ' + d.artist : ''}. Volume ${d.volume ?? '?'}%${d.muted ? ', muted' : ''}.`;
+}
+async function controlMusic({ action, level }){
+  const d = await bridge(action, level);
+  return describeMusic(d);
+}
+// Quick music commands handled instantly (no API cost)
+async function quickMusic(text){
+  const t = text.toLowerCase().replace(/[.!?,]/g, '').trim();
+  let a = null, lvl;
+  if (/^(pause|stop)( the)?( music| song| it)?$/.test(t)) a = 'pause';
+  else if (/^(play|resume|unpause)( the)?( music| song| it)?$/.test(t)) a = 'play';
+  else if (/^(skip|next)( this)?( song| track| one)?$/.test(t) || /^skip (this|the) (song|track)$/.test(t)) a = 'next';
+  else if (/^(previous|go back|last|back)( song| track| one)?$/.test(t)) a = 'previous';
+  else if (/^(mute|unmute)( the)?( music| sound| volume)?$/.test(t)) a = t.startsWith('unmute') ? 'unmute' : 'mute';
+  else if (/^what('s| is) (playing|this song)$/.test(t)) a = 'status';
+  else { const m = t.match(/^(?:set )?(?:the )?volume (?:to )?(\d{1,3})(?: percent| %)?$/); if (m){ a = 'volume'; lvl = Number(m[1]); } }
+  if (!a) return null;
+  try {
+    let d;
+    try { d = await bridge(a, lvl); }
+    catch (islandErr) {
+      // Dynamic Island not running: use the Apple Music extension for play/pause/skip instead
+      const map = { play: 'toggle', pause: 'toggle', next: 'next', previous: 'prev' };
+      if (!extReady || !(a in map || a === 'status')) throw islandErr;
+      let st = await extState();
+      if (a === 'status') return st.title ? `${st.playing ? 'Playing' : 'Paused'}: ${st.title}${st.artist ? ' by ' + st.artist : ''}.` : 'Nothing is playing right now.';
+      if ((a === 'play' && st.playing) || (a === 'pause' && !st.playing)) return a === 'play' ? 'Already playing.' : 'Already paused.';
+      await ext({ type: 'cmd', a: map[a] });
+      await new Promise(r => setTimeout(r, 500));
+      st = await extState();
+      d = { title: st.title, artist: st.artist, volume: null };
+    }
+    if (a === 'status') return describeMusic(d);
+    if (a === 'next' || a === 'previous') return d.title ? `Now playing ${d.title}${d.artist ? ' by ' + d.artist : ''}.` : 'Skipped.';
+    if (a === 'volume') return `Volume set to ${d.volume ?? lvl} percent.`;
+    return { play: 'Playing.', pause: 'Paused.', mute: 'Muted.', unmute: 'Unmuted.' }[a];
+  } catch (e) { return e.message; }
+}
+
+
+/* ---- Apple Music library control through the Now Playing extension ---- */
+let extReady = false, extRid = 0;
+const MY_ORIGIN = location.protocol === 'file:' ? '*' : location.origin;   // local file copy has no origin
+const extWaiting = {};
+window.addEventListener('message', e => {
+  if (e.source !== window || !e.data) return;
+  if (e.data.__jv === 'hello') extReady = true;
+  if (e.data.__jv === 'res' && extWaiting[e.data.rid]){ extWaiting[e.data.rid](e.data.res); delete extWaiting[e.data.rid]; }
+});
+window.postMessage({ __jv: 'ping' }, MY_ORIGIN);
+function ext(msg, timeout = 6000){
+  return new Promise((resolve, reject) => {
+    if (!extReady) return reject(new Error("The Now Playing extension isn't connected. Reload it in chrome://extensions, then refresh me."));
+    const rid = ++extRid;
+    const t = setTimeout(() => { delete extWaiting[rid]; reject(new Error('The music extension took too long to answer.')); }, timeout);
+    extWaiting[rid] = res => { clearTimeout(t); res && res.ok === false ? reject(new Error(res.error || 'Music extension error')) : resolve(res); };
+    window.postMessage({ __jv: 'req', rid, msg }, MY_ORIGIN);
+  });
+}
+async function extState(){
+  const r = await ext({ type: 'getState' });
+  if (!r.appleMusicOpen) throw new Error('Apple Music isn’t open. Open the Apple Music web player first.');
+  return r.state || {};
+}
+const norm = t => (t || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+function bestMatch(items, name){
+  const n = norm(name);
+  if (!items || !items.length) return null;
+  return items.find(i => norm(i.name) === n) || items.find(i => norm(i.name).startsWith(n)) ||
+         items.find(i => norm(i.name).includes(n)) || items[0];
+}
+async function playFromLibrary(kind, name){
+  await extState();
+  const r = await ext({ type: 'req', q: { kind: 'search', term: name } }, 10000);
+  const d = r.data || {};
+  const pools = kind === 'playlist' ? [['playlists','library-playlists']] : kind === 'album' ? [['albums','library-albums']] : kind === 'song' ? [['songs','library-songs']]
+              : [['playlists','library-playlists'], ['albums','library-albums'], ['songs','library-songs']];
+  for (const [key, type] of pools){
+    const hit = bestMatch(d[key], name);
+    if (hit){
+      await ext({ type: 'req', q: { kind: 'play', type: hit.type || type, id: hit.id } }, 10000);
+      const what = type === 'library-playlists' ? 'playlist' : type === 'library-albums' ? 'album' : 'song';
+      return `Playing ${hit.name}${hit.artist && what !== 'playlist' ? ' by ' + hit.artist : ''}${what === 'playlist' ? ' playlist' : ''}.`;
+    }
+  }
+  return `I couldn't find "${name}" in your Apple Music library.`;
+}
+async function setShuffle(on){
+  const st = await extState();
+  if (!!st.shuffle !== on) await ext({ type: 'cmd', a: 'shuffle' });
+  return on ? 'Shuffle on.' : 'Shuffle off.';
+}
+async function setRepeat(mode){   // 0 off, 1 one, 2 all
+  let st = await extState();
+  for (let i = 0; i < 3 && (Number(st.repeat) || 0) !== mode; i++){
+    await ext({ type: 'cmd', a: 'repeat' });
+    await new Promise(r => setTimeout(r, 400));
+    st = await extState();
+  }
+  return mode === 0 ? 'Repeat off.' : mode === 1 ? 'Repeating this song.' : 'Repeating all.';
+}
+async function musicLibrary({ action, name }){
+  if (action === 'open_player'){ await ext({ type: 'open' }); return 'Opened the Now Playing screen.'; }
+  if (action === 'shuffle_on') return setShuffle(true);
+  if (action === 'shuffle_off') return setShuffle(false);
+  if (action === 'repeat_one') return setRepeat(1);
+  if (action === 'repeat_all') return setRepeat(2);
+  if (action === 'repeat_off') return setRepeat(0);
+  if (!name) return 'Tell me what to play.';
+  return playFromLibrary(action.replace('play_', ''), name);
+}
+// Quick library commands (no API cost)
+async function quickLibrary(text){
+  const t = text.toLowerCase().replace(/[.!?,]/g, '').trim();
+  let m;
+  try {
+    if (/^(open|show|pull up)( my| the)? (music|now playing)( player| screen)?$/.test(t)) return await musicLibrary({ action: 'open_player' });
+    if (/^(turn )?shuffle( on)?$/.test(t) || /^turn on shuffle$/.test(t)) return await setShuffle(true);
+    if (/^(turn )?shuffle off$/.test(t) || /^turn off shuffle$/.test(t)) return await setShuffle(false);
+    if (/^(repeat|loop) (this|the) song$/.test(t)) return await setRepeat(1);
+    if (/^(turn )?repeat off$/.test(t) || /^stop repeating$/.test(t)) return await setRepeat(0);
+    if ((m = t.match(/^play (?:my |the )?(.+?) playlist$/)) || (m = t.match(/^play (?:my |the )?playlist (.+)$/))) return await playFromLibrary('playlist', m[1]);
+    if ((m = t.match(/^play (?:the )?album (.+)$/)) || (m = t.match(/^play (?:the )?(.+?) album$/))) return await playFromLibrary('album', m[1]);
+    if ((m = t.match(/^play (?:the )?song (.+)$/))) return await playFromLibrary('song', m[1]);
+  } catch (e) { return e.message; }
+  return null;
+}
+
 async function runTool(name, input){
   setStatus({ open_website: 'Opening…', set_timer: 'Setting timer…', get_weather: 'Checking the weather…',
               get_calendar_events: 'Checking your calendar…', get_recent_emails: 'Checking your email…' }[name] || 'Working…');
@@ -812,6 +989,8 @@ async function runTool(name, input){
     if (name === 'get_weather') return await getWeather(input);
     if (name === 'get_calendar_events') return await getCalendar(input);
     if (name === 'get_recent_emails') return await getEmails(input);
+    if (name === 'control_music') return await controlMusic(input);
+    if (name === 'music_library') return await musicLibrary(input);
     return 'Unknown tool.';
   } catch (e) { return 'Error: ' + e.message; }
 }
@@ -886,16 +1065,53 @@ const PROTOCOLS = [
   { name: "Daddy's home",
     match: /dadd(y|ie)'?s? home/i,
     say: "Welcome back. Canvas, Claude, and Gmail are open. Try to be productive.",
-    open: ['https://canvas.tamu.edu', 'https://claude.ai', 'https://mail.google.com'] }
+    open: [ { id: 'canvas', url: 'https://canvas.tamu.edu' }, { id: 'claude', url: 'https://claude.ai' }, { id: 'gmail', url: 'https://mail.google.com' } ] }
 ];
-function runProtocol(text){
+/* ---- Multi-monitor placement (Chrome's window management permission) ---- */
+function screenKey(sc){ return [sc.label || 'screen', sc.left, sc.top, sc.width, sc.height].join('|'); }
+async function getScreens(ask){
+  if (!('getScreenDetails' in window)) return null;
+  try {
+    if (!ask){
+      const st = await navigator.permissions.query({ name: 'window-management' });
+      if (st.state !== 'granted') return null;
+    }
+    const d = await window.getScreenDetails();
+    return d.screens;
+  } catch (e) { return null; }
+}
+function describeScreen(sc, all){
+  const sorted = all.slice().sort((a, b) => a.left - b.left);
+  const pos = sorted.length === 1 ? '' : sorted.indexOf(sc) === 0 ? 'left' : sorted.indexOf(sc) === sorted.length - 1 ? 'right' : 'middle';
+  return `${sc.isPrimary ? 'Main display' : (sc.isInternal ? 'Laptop screen' : 'Monitor')}${pos ? ' (' + pos + ')' : ''} · ${sc.width}×${sc.height}`;
+}
+function defaultScreenMap(all){
+  const map = {};
+  const prim = all.find(x => x.isPrimary) || all[0];
+  const rest = all.filter(x => x !== prim).sort((a, b) => a.left - b.left);
+  map.canvas = screenKey(prim);
+  if (rest.length >= 2){ map.claude = screenKey(rest[0]); map.gmail = screenKey(rest[rest.length - 1]); }
+  else if (rest.length === 1){ map.claude = screenKey(rest[0]); map.gmail = screenKey(rest[0]); }
+  return map;
+}
+
+async function runProtocol(text){
   const pr = PROTOCOLS.find(x => x.match.test(text));
   if (!pr) return null;
+  const screens = await getScreens(false);
+  const byKey = {}; (screens || []).forEach(sc => byKey[screenKey(sc)] = sc);
+  const multi = screens && screens.length > 1;
   let blocked = 0;
-  for (const url of pr.open){ if (!window.open(url, '_blank')) blocked++; }
-  return blocked
-    ? `${pr.name} protocol ran, but the browser blocked ${blocked} tab${blocked > 1 ? 's' : ''}. Allow pop-ups for this site in the address bar.`
-    : pr.say;
+  for (const item of pr.open){
+    const sc = multi ? byKey[(S.screenMap || {})[item.id]] : null;
+    const w = sc
+      ? window.open(item.url, '_blank', `left=${sc.availLeft},top=${sc.availTop},width=${sc.availWidth},height=${sc.availHeight}`)
+      : window.open(item.url, '_blank');
+    if (!w) blocked++;
+  }
+  if (blocked) return `${pr.name} protocol ran, but the browser blocked ${blocked} window${blocked > 1 ? 's' : ''}. Allow pop-ups for this site in the address bar.`;
+  if (multi && !Object.keys(S.screenMap || {}).length) return pr.say + ' Set up your screens in the gear settings so each one lands on the right monitor.';
+  return pr.say;
 }
 
 async function handleRequest(text){
@@ -903,7 +1119,7 @@ async function handleRequest(text){
   if (!text) return;
   setStatus('Thinking…');
   showWords('“' + text + '”', true);
-  let reply = runProtocol(text) || handleDial(text);
+  let reply = (await runProtocol(text)) || (await quickLibrary(text)) || (await quickMusic(text)) || handleDial(text);
   try { if (!reply) reply = await askClaude(text); }
   catch (e) { reply = "I can't reach the Claude API right now. Check your internet."; }
   setStatus(listenLabel());
